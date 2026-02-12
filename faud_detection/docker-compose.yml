@@ -1,0 +1,365 @@
+name: credit-fraud-mlops
+
+networks:
+  credit-fraud-net:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  minio_data:
+  grafana_data:
+  postgres_data:
+  connect_data:
+
+services:
+  # =========================
+  # Kafka (KRaft mode)
+  # =========================
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: credit-fraud-kafka
+    networks: [credit-fraud-net]
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://credit-fraud-kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@credit-fraud-kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://credit-fraud-kafka:9092,CONTROLLER://credit-fraud-kafka:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      CLUSTER_ID: MkQkTjNqNkx5TGpkbHdRZQ
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server credit-fraud-kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    networks: [credit-fraud-net]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: credit-fraud
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: credit-fraud-kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: ""
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: credit-fraud-kafka-init
+    networks: [credit-fraud-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -lc "
+      echo 'Creating Kafka topics for credit fraud pipeline';
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --create --if-not-exists --topic credit_txn_raw       --partitions 6 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --create --if-not-exists --topic credit_txn_clean     --partitions 6 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --create --if-not-exists --topic credit_txn_features  --partitions 6 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --create --if-not-exists --topic credit_txn_scored    --partitions 6 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --create --if-not-exists --topic credit_txn_dlq       --partitions 3 --replication-factor 1;
+
+      echo 'Setting DLQ retention - 14 days';
+      /opt/kafka/bin/kafka-configs.sh --bootstrap-server credit-fraud-kafka:9092 --entity-type topics --entity-name credit_txn_dlq \
+        --alter --add-config retention.ms=1209600000 || true;
+
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --list;
+      "
+
+  # ==========================================================
+  # Transaction Store (Postgres) - for CDC source of truth
+  # ==========================================================
+  postgres:
+    image: postgres:16
+    container_name: credit-fraud-postgres
+    networks: [credit-fraud-net]
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=creditfraud
+      - POSTGRES_USER=fraud
+      - POSTGRES_PASSWORD=fraud123
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud -d creditfraud"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  # ==========================================================
+  # Kafka Connect + Debezium (CDC)
+  # ==========================================================
+  kafka-connect:
+    image: debezium/connect:2.7.3.Final
+    container_name: credit-fraud-kafka-connect
+    networks: [credit-fraud-net]
+    ports:
+      - "8083:8083"
+    environment:
+      - BOOTSTRAP_SERVERS=credit-fraud-kafka:9092
+      - GROUP_ID=credit-fraud-connect
+      - CONFIG_STORAGE_TOPIC=credit_connect_configs
+      - OFFSET_STORAGE_TOPIC=credit_connect_offsets
+      - STATUS_STORAGE_TOPIC=credit_connect_status
+      - KEY_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - VALUE_CONVERTER=org.apache.kafka.connect.json.JsonConverter
+      - KEY_CONVERTER_SCHEMAS_ENABLE=false
+      - VALUE_CONVERTER_SCHEMAS_ENABLE=false
+      - CONNECT_REST_ADVERTISED_HOST_NAME=credit-fraud-kafka-connect
+    volumes:
+      - connect_data:/kafka/connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  debezium-init:
+    image: curlimages/curl:8.10.1
+    container_name: credit-fraud-debezium-init
+    networks: [credit-fraud-net]
+    depends_on:
+      kafka-connect:
+        condition: service_started
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for Kafka Connect...';
+      until curl -s http://credit-fraud-kafka-connect:8083/connectors >/dev/null; do sleep 3; done;
+
+      echo 'Register Debezium Postgres connector (idempotent)';
+      curl -s -X PUT http://credit-fraud-kafka-connect:8083/connectors/creditfraud-pg/config \
+        -H 'Content-Type: application/json' \
+        -d '{
+          \"connector.class\": \"io.debezium.connector.postgresql.PostgresConnector\",
+          \"database.hostname\": \"credit-fraud-postgres\",
+          \"database.port\": \"5432\",
+          \"database.user\": \"fraud\",
+          \"database.password\": \"fraud123\",
+          \"database.dbname\": \"creditfraud\",
+          \"topic.prefix\": \"credit\",
+          \"plugin.name\": \"pgoutput\",
+          \"slot.name\": \"creditfraud_slot\",
+          \"publication.autocreate.mode\": \"filtered\",
+          \"table.include.list\": \"public.transactions\",
+          \"tombstones.on.delete\": \"false\",
+          \"snapshot.mode\": \"initial\",
+
+          \"transforms\": \"route\",
+          \"transforms.route.type\": \"org.apache.kafka.connect.transforms.RegexRouter\",
+          \"transforms.route.regex\": \"credit\\\\.public\\\\.transactions\",
+          \"transforms.route.replacement\": \"credit_txn_raw\"
+        }' || true;
+
+      echo 'Done';
+      "
+
+  # =========================
+  # Flink (Session cluster)
+  #  - IMPORTANT: use custom image with job jars inside
+  # =========================
+  flink-jobmanager:
+    build:
+      context: ./credit-fraud-detection
+      dockerfile: Dockerfile.flink-jobs
+    image: credit-fraud-flink-jobs:1.0
+    container_name: credit-fraud-flink-jm
+    networks: [credit-fraud-net]
+    ports:
+      - "8081:8081"
+      - "9249:9249"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: credit-fraud-flink-jm
+        parallelism.default: 2
+        metrics.reporters: prom
+        metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
+        metrics.reporter.prom.port: 9249
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  flink-taskmanager:
+    image: credit-fraud-flink-jobs:1.0
+    container_name: credit-fraud-flink-tm
+    networks: [credit-fraud-net]
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: credit-fraud-flink-jm
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+        metrics.reporters: prom
+        metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
+        metrics.reporter.prom.port: 9249
+    depends_on:
+      - flink-jobmanager
+
+  # =========================
+  # Submit Flink Job A (run-once)
+  # =========================
+  submit-cleanse:
+    image: credit-fraud-flink-jobs:1.0
+    container_name: submit-cleanse
+    networks: [credit-fraud-net]
+    depends_on:
+      debezium-init:
+        condition: service_completed_successfully
+      flink-taskmanager:
+        condition: service_started
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=credit-fraud-kafka:9092
+      - KAFKA_GROUP_ID=flink-cleanse-v1
+      - TOPIC_RAW=credit_txn_raw
+      - TOPIC_CLEAN=credit_txn_clean
+      - TOPIC_DLQ=credit_txn_dlq
+      - CHECKPOINT_INTERVAL_MS=10000
+      - DEDUP_TTL_HOURS=24
+      - DROP_DELETE_EVENTS=true
+      - KAFKA_STARTING_OFFSETS=earliest
+    entrypoint: ["/bin/bash","-lc"]
+    command: >
+      echo '[submit-cleanse] waiting JM REST...';
+      until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done;
+
+      echo '[submit-cleanse] submitting job A...';
+      /opt/flink/bin/flink run -d -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.DataCleanerJob local:///opt/flink/usrlib/credit-fraud-jobs.jar
+    restart: "no"
+
+  # =========================
+  # Submit Flink Job B (run-once)
+  # =========================
+  submit-features:
+    image: credit-fraud-flink-jobs:1.0
+    container_name: submit-features
+    networks: [credit-fraud-net]
+    depends_on:
+      submit-cleanse:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=credit-fraud-kafka:9092
+      - KAFKA_GROUP_ID=flink-features-v1
+      - TOPIC_CLEAN=credit_txn_clean
+      - TOPIC_FEATURES=credit_txn_features
+      - TOPIC_DLQ=credit_txn_dlq
+      - CHECKPOINT_INTERVAL_MS=10000
+      - KAFKA_STARTING_OFFSETS=earliest
+    entrypoint: ["/bin/bash","-lc"]
+    command: >
+      echo '[submit-features] waiting JM REST...';
+      until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done;
+
+      echo '[submit-features] submitting job B...';
+      /opt/flink/bin/flink run -d -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.FeatureEngineeringJob local:///opt/flink/usrlib/credit-fraud-jobs.jar
+    restart: "no"
+
+  # =========================
+  # Scoring (Quarkus) - consume features -> produce scored
+  # =========================
+  # scorer:
+  #   build:
+  #     context: ./credit-fraud-scorer
+  #     dockerfile: Dockerfile.scorer
+  #   container_name: credit-fraud-scorer
+  #   networks: [credit-fraud-net]
+  #   depends_on:
+  #     submit-features:
+  #       condition: service_completed_successfully
+  #     kafka-init:
+  #       condition: service_completed_successfully
+  #   environment:
+  #     - KAFKA_BOOTSTRAP_SERVERS=credit-fraud-kafka:9092
+  #     - KAFKA_GROUP_ID=scorer-v1
+  #     - TOPIC_FEATURES=credit_txn_features
+  #     - TOPIC_SCORED=credit_txn_scored
+  #     - TOPIC_DLQ=credit_txn_dlq
+  #     - MODEL_PATH=/models/xgb.json
+  #     - SCORE_THRESHOLD=0.5
+  #   restart: unless-stopped
+
+  # =========================
+  # MinIO
+  # =========================
+  minio:
+    image: minio/minio:latest
+    container_name: credit-fraud-minio
+    networks: [credit-fraud-net]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: credit-fraud-minio-init
+    networks: [credit-fraud-net]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://credit-fraud-minio:9000 minioadmin minioadmin123;
+      mc mb -p local/credit-fraud-bronze || true;
+      mc mb -p local/credit-fraud-silver || true;
+      mc mb -p local/credit-fraud-gold || true;
+      mc mb -p local/credit-fraud-dlq || true;
+      mc ls local;
+      "
+
+  # =========================
+  # Prometheus & Grafana
+  # =========================
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: credit-fraud-prometheus
+    networks: [credit-fraud-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - flink-jobmanager
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: credit-fraud-grafana
+    networks: [credit-fraud-net]
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus

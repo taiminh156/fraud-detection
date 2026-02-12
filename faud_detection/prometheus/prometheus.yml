@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["credit-fraud-prometheus:9090"]
+
+  - job_name: "flink-jobmanager"
+    metrics_path: /
+    static_configs:
+      - targets: ["credit-fraud-flink-jm:9249"]
+
+  - job_name: "flink-taskmanager"
+    metrics_path: /
+    static_configs:
+      - targets: ["credit-fraud-flink-tm:9249"]

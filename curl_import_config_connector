@@ -1,0 +1,2 @@
+docker exec credit-fraud-kafka kafka-topics.sh --bootstrap-server credit-fraud-kafka:9092 --list
+docker exec credit-fraud-kafka kafka-console-consumer.sh --bootstrap-server credit-fraud-kafka:9092 --topic credit_txn_raw --max-messages 2 --from-beginning

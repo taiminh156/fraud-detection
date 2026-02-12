@@ -1,0 +1,18 @@
+# Build stage
+FROM maven:3.8.1-openjdk-8 AS builder
+WORKDIR /build
+COPY pom.xml .
+COPY src ./src
+RUN mvn clean package -DskipTests -Dorg.slf4j.simpleLogger.defaultLogLevel=warn
+
+# Runtime stage
+FROM flink:1.20.1-scala_2.12-java8
+WORKDIR /opt/flink
+# Copy the built JAR from builder
+COPY --from=builder /build/target/credit-fraud-detection-1.0-SNAPSHOT.jar /opt/flink/app.jar
+
+# Copy job configuration
+COPY src/main/resources/application.properties /opt/flink/
+
+# Run the cleaning job
+ENTRYPOINT ["flink", "run", "-c", "com.thesis.flinkapp.jobs.DataCleanerJob", "/opt/flink/app.jar"]

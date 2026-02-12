@@ -1,0 +1,5 @@
+FROM eclipse-temurin:11-jre
+WORKDIR /app
+# Minimal placeholder image for scoring service while project artifacts are prepared
+# Replace with real build or image later (e.g., Quarkus native or JVM jar)
+CMD ["/bin/sh","-c","echo 'scorer placeholder'; sleep infinity"]
