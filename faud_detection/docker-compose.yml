@@ -138,37 +138,20 @@ services:
         condition: service_started
       kafka-init:
         condition: service_completed_successfully
-    entrypoint: >
-      /bin/sh -c "
-      echo 'Waiting for Kafka Connect...';
-      until curl -s http://credit-fraud-kafka-connect:8083/connectors >/dev/null; do sleep 3; done;
+    entrypoint: sh
+    command:
+      - -c
+      - |
+        echo 'Waiting for Kafka Connect...';
+        until curl -s http://credit-fraud-kafka-connect:8083/connectors >/dev/null; do sleep 3; done;
 
-      echo 'Register Debezium Postgres connector (idempotent)';
-      curl -s -X PUT http://credit-fraud-kafka-connect:8083/connectors/creditfraud-pg/config \
-        -H 'Content-Type: application/json' \
-        -d '{
-          \"connector.class\": \"io.debezium.connector.postgresql.PostgresConnector\",
-          \"database.hostname\": \"credit-fraud-postgres\",
-          \"database.port\": \"5432\",
-          \"database.user\": \"fraud\",
-          \"database.password\": \"fraud123\",
-          \"database.dbname\": \"creditfraud\",
-          \"topic.prefix\": \"credit\",
-          \"plugin.name\": \"pgoutput\",
-          \"slot.name\": \"creditfraud_slot\",
-          \"publication.autocreate.mode\": \"filtered\",
-          \"table.include.list\": \"public.transactions\",
-          \"tombstones.on.delete\": \"false\",
-          \"snapshot.mode\": \"initial\",
+        echo 'Register Debezium Postgres connector (idempotent)';
+        curl -s -X PUT http://credit-fraud-kafka-connect:8083/connectors/creditfraud-pg/config \
+          -H "Content-Type: application/json" \
+          -d '{"connector.class":"io.debezium.connector.postgresql.PostgresConnector","database.hostname":"credit-fraud-postgres","database.port":"5432","database.user":"fraud","database.password":"fraud123","database.dbname":"creditfraud","topic.prefix":"credit","plugin.name":"pgoutput","slot.name":"creditfraud_slot","publication.autocreate.mode":"filtered","table.include.list":"public.transactions","tombstones.on.delete":"false","snapshot.mode":"initial","transforms":"route","transforms.route.type":"org.apache.kafka.connect.transforms.RegexRouter","transforms.route.regex":"credit\\.public\\.transactions","transforms.route.replacement":"credit_txn_raw"}' \
+          -w "\n%{http_code}\n" || true;
 
-          \"transforms\": \"route\",
-          \"transforms.route.type\": \"org.apache.kafka.connect.transforms.RegexRouter\",
-          \"transforms.route.regex\": \"credit\\\\.public\\\\.transactions\",
-          \"transforms.route.replacement\": \"credit_txn_raw\"
-        }' || true;
-
-      echo 'Done';
-      "
+        echo 'Done';
 
   # =========================
   # Flink (Session cluster)
