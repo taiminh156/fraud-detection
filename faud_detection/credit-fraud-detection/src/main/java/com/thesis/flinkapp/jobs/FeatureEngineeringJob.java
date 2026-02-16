@@ -10,7 +10,7 @@ import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 
-public class DataCleanerJob {
+public class FeatureEngineeringJob {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -20,11 +20,10 @@ public class DataCleanerJob {
 
     public static void run() throws Exception {
         final String bootstrapServers = JobRuntime.envOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:29092");
-        final String groupId = JobRuntime.envOrDefault("KAFKA_GROUP_ID", "flink-cleanse-v1");
-        final String rawTopic = JobRuntime.envOrDefault("TOPIC_RAW", "credit_txn_raw");
+        final String groupId = JobRuntime.envOrDefault("KAFKA_GROUP_ID", "flink-features-v1");
         final String cleanTopic = JobRuntime.envOrDefault("TOPIC_CLEAN", "credit_txn_clean");
+        final String featuresTopic = JobRuntime.envOrDefault("TOPIC_FEATURES", "credit_txn_features");
         final String offsetMode = JobRuntime.envOrDefault("KAFKA_STARTING_OFFSETS", "earliest");
-        final boolean dropDeleteEvents = Boolean.parseBoolean(JobRuntime.envOrDefault("DROP_DELETE_EVENTS", "true"));
         final long checkpointMs = JobRuntime.envLongOrDefault("CHECKPOINT_INTERVAL_MS", 10000L);
 
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -32,7 +31,7 @@ public class DataCleanerJob {
 
         final KafkaSource<String> source = KafkaSource.<String>builder()
                 .setBootstrapServers(bootstrapServers)
-                .setTopics(rawTopic)
+                .setTopics(cleanTopic)
                 .setGroupId(groupId)
                 .setStartingOffsets(JobRuntime.resolveOffsets(offsetMode))
                 .setValueOnlyDeserializer(new SimpleStringSchema())
@@ -42,57 +41,54 @@ public class DataCleanerJob {
                 .setBootstrapServers(bootstrapServers)
                 .setRecordSerializer(
                         KafkaRecordSerializationSchema.builder()
-                                .setTopic(cleanTopic)
+                                .setTopic(featuresTopic)
                                 .setValueSerializationSchema(new SimpleStringSchema())
                                 .build()
                 )
                 .build();
 
-        env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka-raw-source")
-                .map(raw -> cleanDebeziumRecord(raw, dropDeleteEvents))
-                .filter(cleaned -> cleaned != null)
+        env.fromSource(source, WatermarkStrategy.noWatermarks(), "kafka-clean-source")
+                .map(FeatureEngineeringJob::buildFeatures)
+                .filter(feature -> feature != null)
                 .sinkTo(sink)
-                .name("kafka-clean-sink");
+                .name("kafka-feature-sink");
 
-        env.execute("Credit Txn Data Cleaner Job");
+        env.execute("Credit Txn Feature Engineering Job");
     }
 
-    private static String cleanDebeziumRecord(String rawJson, boolean dropDeleteEvents) {
+    private static String buildFeatures(String cleanedJson) {
         try {
-            JsonNode root = MAPPER.readTree(rawJson);
-            JsonNode payload = root.get("payload");
-            if (payload == null || payload.isNull()) {
+            JsonNode row = MAPPER.readTree(cleanedJson);
+            long txnId = longVal(row, "txn_id", 0L);
+            if (txnId <= 0L) {
                 return null;
             }
 
-            String op = text(payload, "op", "");
-            JsonNode row = payload.get("after");
-            if (row == null || row.isNull()) {
-                row = payload.get("before");
-            }
-            if (row == null || row.isNull()) {
-                return null;
-            }
-            if (dropDeleteEvents && "d".equals(op)) {
-                return null;
-            }
-
-            ObjectNode cleaned = MAPPER.createObjectNode();
-            cleaned.put("txn_id", longVal(row, "txn_id", 0L));
-            cleaned.put("event_time_s", doubleVal(row, "event_time_s", 0.0d));
+            double amount = doubleVal(row, "amount", 0.0d);
+            double absVSum = 0.0d;
+            double absVMax = 0.0d;
             for (int i = 1; i <= 28; i++) {
-                String field = "v" + i;
-                cleaned.put(field, doubleVal(row, field, 0.0d));
+                double v = Math.abs(doubleVal(row, "v" + i, 0.0d));
+                absVSum += v;
+                absVMax = Math.max(absVMax, v);
             }
-            cleaned.put("amount", doubleVal(row, "amount", 0.0d));
-            cleaned.put("class", intVal(row, "class", 0));
-            cleaned.put("op", op);
-            cleaned.put("event_ts_ms", longVal(payload, "ts_ms", 0L));
+            double absVMean = absVSum / 28.0d;
 
-            if (cleaned.get("txn_id").asLong() <= 0L) {
-                return null;
-            }
-            return MAPPER.writeValueAsString(cleaned);
+            ObjectNode out = MAPPER.createObjectNode();
+            out.put("txn_id", txnId);
+            out.put("event_ts_ms", longVal(row, "event_ts_ms", 0L));
+            out.put("event_time_s", doubleVal(row, "event_time_s", 0.0d));
+            out.put("amount", amount);
+            out.put("class", intVal(row, "class", 0));
+            out.put("op", text(row, "op", ""));
+
+            out.put("amount_log1p", Math.log1p(Math.max(amount, 0.0d)));
+            out.put("amount_is_zero", amount == 0.0d ? 1 : 0);
+            out.put("abs_v_mean", absVMean);
+            out.put("abs_v_max", absVMax);
+            out.put("high_risk_signal", absVMax >= 10.0d ? 1 : 0);
+
+            return MAPPER.writeValueAsString(out);
         } catch (Exception ignored) {
             return null;
         }
