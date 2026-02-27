@@ -1,15 +1,15 @@
-# Build stage (Java 21 để khớp Flink 2.2 + java21)
-FROM maven:3.9.9-eclipse-temurin-21 AS builder
+# Build stage (multi-arch friendly; compile target remains Java 8 from pom.xml)
+FROM maven:3.9.9-eclipse-temurin-17 AS builder
 WORKDIR /build
 COPY pom.xml .
 COPY src ./src
 RUN mvn -q -DskipTests clean package
 
-# Runtime stage (Flink base giống cluster)
-FROM flink:2.2.0-scala_2.12-java21
+# Runtime stage (align with Flink dependencies in pom.xml)
+FROM flink:1.20.1-scala_2.12-java11
 
 RUN mkdir -p /opt/flink/usrlib
+RUN mkdir -p /opt/flink/plugins/s3-fs-hadoop && cp /opt/flink/opt/flink-s3-fs-hadoop-*.jar /opt/flink/plugins/s3-fs-hadoop/
 
-# Copy fat-jar vào usrlib
-# Sửa đúng tên jar sau khi build (nên dùng shade plugin để ra 1 jar chạy được)
-COPY --from=builder /build/target/*.jar /opt/flink/usrlib/credit-fraud-jobs.jar
+# Copy shaded fat-jar (avoid picking original-*.jar)
+COPY --from=builder /build/target/credit-fraud-detection-1.0-SNAPSHOT.jar /opt/flink/usrlib/credit-fraud-jobs.jar

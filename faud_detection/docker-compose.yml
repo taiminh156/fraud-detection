@@ -32,6 +32,8 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       CLUSTER_ID: MkQkTjNqNkx5TGpkbHdRZQ
     volumes:
       - kafka_data:/var/lib/kafka/data
@@ -51,6 +53,8 @@ services:
       KAFKA_CLUSTERS_0_NAME: credit-fraud
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: credit-fraud-kafka:9092
       KAFKA_CLUSTERS_0_ZOOKEEPER: ""
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: credit-fraud-connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://credit-fraud-kafka-connect:8083
 
   kafka-init:
     image: apache/kafka:3.7.0
@@ -173,6 +177,11 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: credit-fraud-flink-jm
         parallelism.default: 2
+        fs.s3a.endpoint: http://credit-fraud-minio:9000
+        fs.s3a.path.style.access: true
+        fs.s3a.access.key: minioadmin
+        fs.s3a.secret.key: minioadmin123
+        fs.s3a.connection.ssl.enabled: false
         metrics.reporters: prom
         metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
         metrics.reporter.prom.port: 9249
@@ -191,6 +200,11 @@ services:
         jobmanager.rpc.address: credit-fraud-flink-jm
         taskmanager.numberOfTaskSlots: 2
         parallelism.default: 2
+        fs.s3a.endpoint: http://credit-fraud-minio:9000
+        fs.s3a.path.style.access: true
+        fs.s3a.access.key: minioadmin
+        fs.s3a.secret.key: minioadmin123
+        fs.s3a.connection.ssl.enabled: false
         metrics.reporters: prom
         metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
         metrics.reporter.prom.port: 9249
@@ -207,6 +221,8 @@ services:
     depends_on:
       debezium-init:
         condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
       flink-taskmanager:
         condition: service_started
     environment:
@@ -218,14 +234,23 @@ services:
       - CHECKPOINT_INTERVAL_MS=10000
       - DEDUP_TTL_HOURS=24
       - DROP_DELETE_EVENTS=true
-      - KAFKA_STARTING_OFFSETS=earliest
-    entrypoint: ["/bin/bash","-lc"]
-    command: >
-      echo '[submit-cleanse] waiting JM REST...';
-      until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done;
-
-      echo '[submit-cleanse] submitting job A...';
-      /opt/flink/bin/flink run -d -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.DataCleanerJob local:///opt/flink/usrlib/credit-fraud-jobs.jar
+      - KAFKA_STARTING_OFFSETS=committed
+      - KAFKA_COMMITTED_OFFSET_RESET=latest
+      - KAFKA_TXN_PREFIX=cleaner-v1
+      - KAFKA_TX_TIMEOUT_MS=600000
+      - WRITE_BRONZE_PARQUET=true
+      - BRONZE_PATH=s3a://credit-fraud-bronze/txn_clean
+      - WRITE_SILVER_PARQUET=true
+      - SILVER_PATH=s3a://credit-fraud-silver/txn_clean
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        echo '[submit-cleanse] waiting JM REST...'
+        until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done
+        echo '[submit-cleanse] submitting job A...'
+        /opt/flink/bin/flink run -d -p 1 -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.DataCleanerJob /opt/flink/usrlib/credit-fraud-jobs.jar
     restart: "no"
 
   # =========================
@@ -238,6 +263,8 @@ services:
     depends_on:
       submit-cleanse:
         condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=credit-fraud-kafka:9092
       - KAFKA_GROUP_ID=flink-features-v1
@@ -245,14 +272,21 @@ services:
       - TOPIC_FEATURES=credit_txn_features
       - TOPIC_DLQ=credit_txn_dlq
       - CHECKPOINT_INTERVAL_MS=10000
-      - KAFKA_STARTING_OFFSETS=earliest
-    entrypoint: ["/bin/bash","-lc"]
-    command: >
-      echo '[submit-features] waiting JM REST...';
-      until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done;
-
-      echo '[submit-features] submitting job B...';
-      /opt/flink/bin/flink run -d -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.FeatureEngineeringJob local:///opt/flink/usrlib/credit-fraud-jobs.jar
+      - KAFKA_STARTING_OFFSETS=committed
+      - KAFKA_COMMITTED_OFFSET_RESET=latest
+      - KAFKA_TXN_PREFIX=features-v1
+      - KAFKA_TX_TIMEOUT_MS=600000
+      - WRITE_GOLD_PARQUET=true
+      - GOLD_PATH=s3a://credit-fraud-gold/txn_features
+    command:
+      - /bin/bash
+      - -lc
+      - |
+        set -e
+        echo '[submit-features] waiting JM REST...'
+        until curl -s http://credit-fraud-flink-jm:8081/overview >/dev/null; do sleep 2; done
+        echo '[submit-features] submitting job B...'
+        /opt/flink/bin/flink run -d -p 1 -m http://credit-fraud-flink-jm:8081 -c com.thesis.flinkapp.jobs.FeatureEngineeringJob /opt/flink/usrlib/credit-fraud-jobs.jar
     restart: "no"
 
   # =========================

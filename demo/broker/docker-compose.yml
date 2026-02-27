@@ -1,0 +1,57 @@
+name: kafka-demo
+
+networks:
+  kafka-demo-net:
+    driver: bridge
+
+services:
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: demo-kafka
+    networks: [kafka-demo-net]
+    ports:
+      - "39092:39092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://demo-kafka:9092,PLAINTEXT_HOST://localhost:39092
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@demo-kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://demo-kafka:9092,CONTROLLER://demo-kafka:9093,PLAINTEXT_HOST://0.0.0.0:39092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: MjM0NTY3ODkwMTIzNDU2Nzg5MA
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server demo-kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: demo-kafka-init
+    networks: [kafka-demo-net]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: >
+      /bin/bash -lc "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server demo-kafka:9092 --create --if-not-exists --topic demo_simple_events --partitions 3 --replication-factor 1;
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server demo-kafka:9092 --list;
+      "
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: demo-kafka-ui
+    networks: [kafka-demo-net]
+    ports:
+      - "8088:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: kafka-demo
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: demo-kafka:9092
